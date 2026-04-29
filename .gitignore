@@ -1,0 +1,26 @@
+# Secrets
+.env
+*.env
+
+# User data and database
+user_data/
+instance/
+output/
+
+# Personal portfolio files
+portfolio.csv
+
+# Claude Code settings
+.claude/
+
+# Downloaded binaries
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+
+# macOS
+.DS_Store

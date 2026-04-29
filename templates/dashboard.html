@@ -1,0 +1,180 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Wealth Advisor{% endblock %}
+
+{% block content %}
+<div class="row g-4">
+
+  <!-- ── Upload / Enter Portfolio ─────────────────────────────────────── -->
+  <div class="col-lg-7">
+    <div class="card h-100">
+      <div class="card-header bg-primary text-white py-3">
+        <i class="bi bi-upload me-2"></i>Analyze Your Portfolio
+      </div>
+      <div class="card-body p-4">
+
+        <!-- Tab switcher -->
+        <ul class="nav nav-tabs mb-4" id="inputTabs">
+          <li class="nav-item">
+            <a class="nav-link active" data-bs-toggle="tab" href="#tab-file">
+              <i class="bi bi-file-earmark-spreadsheet me-1"></i>Upload File
+            </a>
+          </li>
+          <li class="nav-item">
+            <a class="nav-link" data-bs-toggle="tab" href="#tab-text">
+              <i class="bi bi-keyboard me-1"></i>Enter Manually
+            </a>
+          </li>
+        </ul>
+
+        <form method="POST" action="/analyze" enctype="multipart/form-data">
+          <div class="tab-content">
+
+            <!-- File upload tab -->
+            <div class="tab-pane fade show active" id="tab-file">
+              <div class="mb-3">
+                <label class="form-label fw-semibold">CSV or TXT file</label>
+                <input type="file" name="portfolio_file" class="form-control" accept=".csv,.txt">
+                <div class="form-text">Accepted formats: .csv, .txt</div>
+              </div>
+            </div>
+
+            <!-- Manual entry tab -->
+            <div class="tab-pane fade" id="tab-text">
+              <div class="mb-3">
+                <label class="form-label fw-semibold">Paste or type your portfolio</label>
+                <textarea name="portfolio_text" class="form-control font-monospace"
+                          rows="8" placeholder="Ticker,Shares,Current Value,Cost Basis,Gain/Loss
+AAPL,50,9250,6000,3250
+MSFT,30,12300,9000,3300
+SPY,20,11200,8500,2700"></textarea>
+              </div>
+            </div>
+          </div>
+
+          <button type="submit" class="btn btn-primary px-4">
+            <i class="bi bi-play-fill me-1"></i>Run Analysis
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Format Guide ──────────────────────────────────────────────────── -->
+  <div class="col-lg-5">
+    <div class="card h-100">
+      <div class="card-header bg-light py-3 fw-semibold">
+        <i class="bi bi-info-circle me-2 text-primary"></i>File Format Guide
+      </div>
+      <div class="card-body p-4">
+
+        <p class="text-muted small mb-3">Only the <strong>Ticker</strong> column is required. All other columns are optional.</p>
+
+        <div class="table-responsive mb-3">
+          <table class="table table-sm table-bordered small">
+            <thead class="table-light">
+              <tr>
+                <th>Column</th>
+                <th>Required?</th>
+                <th>Example</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td><code>Ticker</code></td><td><span class="badge bg-danger">Required</span></td><td>AAPL</td></tr>
+              <tr><td><code>Shares</code></td><td><span class="badge bg-secondary">Optional</span></td><td>50</td></tr>
+              <tr><td><code>Current Value</code></td><td><span class="badge bg-secondary">Optional</span></td><td>9250.00</td></tr>
+              <tr><td><code>Cost Basis</code></td><td><span class="badge bg-secondary">Optional</span></td><td>6000.00</td></tr>
+              <tr><td><code>Gain/Loss</code></td><td><span class="badge bg-secondary">Optional</span></td><td>3250.00</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p class="small fw-semibold mb-1">Full CSV example:</p>
+        <pre class="bg-light rounded p-2 small mb-3" style="font-size:0.78em">Ticker,Shares,Current Value,Cost Basis,Gain/Loss
+AAPL,50,9250,6000,3250
+MSFT,30,12300,9000,3300
+SPY,20,11200,8500,2700
+NVDA,15,19500,8000,11500</pre>
+
+        <p class="small fw-semibold mb-1">Plain text (tickers only):</p>
+        <pre class="bg-light rounded p-2 small" style="font-size:0.78em">AAPL
+MSFT
+SPY
+NVDA
+JNJ</pre>
+
+        <div class="alert alert-info py-2 px-3 mt-3 small mb-0">
+          <i class="bi bi-lightbulb me-1"></i>
+          Column names are flexible — <em>Symbol</em>, <em>Stock</em>, <em>Quantity</em>, <em>Market Value</em> etc. are all recognized automatically.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Run History ───────────────────────────────────────────────────── -->
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header bg-light py-3 fw-semibold">
+        <i class="bi bi-clock-history me-2 text-primary"></i>Analysis History
+      </div>
+      <div class="card-body p-0">
+        {% if runs %}
+        <div class="table-responsive">
+          <table class="table table-hover mb-0">
+            <thead class="table-light">
+              <tr>
+                <th class="ps-4">Date &amp; Time</th>
+                <th>File</th>
+                <th>Status</th>
+                <th class="text-end pe-4">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for run in runs %}
+              <tr>
+                <td class="ps-4 text-muted small">{{ run.created_at[:16].replace('T', ' ') }}</td>
+                <td class="small">{{ run.original_filename or '—' }}</td>
+                <td>
+                  {% if run.status == 'completed' %}
+                    <span class="badge bg-success"><i class="bi bi-check-circle me-1"></i>Completed</span>
+                  {% elif run.status == 'running' %}
+                    <span class="badge bg-primary"><i class="bi bi-arrow-repeat me-1"></i>Running</span>
+                  {% elif run.status == 'failed' %}
+                    <span class="badge bg-danger" title="{{ run.error_message }}"><i class="bi bi-x-circle me-1"></i>Failed</span>
+                  {% else %}
+                    <span class="badge bg-secondary">Pending</span>
+                  {% endif %}
+                </td>
+                <td class="text-end pe-4">
+                  {% if run.status == 'completed' %}
+                    <a href="/report/{{ run.id }}" target="_blank" class="btn btn-sm btn-outline-primary me-1">
+                      <i class="bi bi-eye me-1"></i>View Report
+                    </a>
+                    <a href="/download/html/{{ run.id }}" class="btn btn-sm btn-outline-secondary me-1">
+                      <i class="bi bi-download me-1"></i>HTML
+                    </a>
+                    <a href="/download/json/{{ run.id }}" class="btn btn-sm btn-outline-secondary">
+                      <i class="bi bi-filetype-json me-1"></i>JSON
+                    </a>
+                  {% elif run.status == 'running' or run.status == 'pending' %}
+                    <a href="/status/{{ run.id }}" class="btn btn-sm btn-outline-primary">
+                      <i class="bi bi-hourglass-split me-1"></i>View Progress
+                    </a>
+                  {% endif %}
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        {% else %}
+        <div class="text-center py-5 text-muted">
+          <i class="bi bi-inbox" style="font-size:2.5rem;opacity:0.3"></i>
+          <p class="mt-2">No analyses yet. Upload your portfolio above to get started.</p>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+</div>
+{% endblock %}

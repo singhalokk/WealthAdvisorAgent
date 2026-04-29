@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block title %}Analysis Running — Wealth Advisor{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center mt-4">
+  <div class="col-md-6">
+    <div class="card p-5 text-center">
+
+      <div id="spinner-area">
+        <div class="spinner-border text-primary mb-3" style="width:3rem;height:3rem" role="status"></div>
+        <h4 class="fw-bold mb-1">Analyzing Your Portfolio</h4>
+        <p id="status-msg" class="text-muted mb-4">Starting up...</p>
+
+        <div class="progress mb-4" style="height:8px">
+          <div id="progress-bar" class="progress-bar progress-bar-striped progress-bar-animated bg-primary"
+               style="width:10%"></div>
+        </div>
+
+        <div class="d-flex justify-content-center gap-2 flex-wrap small text-muted" id="steps">
+          <span id="step-read"  class="badge bg-light text-dark border">📂 Reading file</span>
+          <span id="step-data"  class="badge bg-light text-dark border">📡 Market data</span>
+          <span id="step-ai"    class="badge bg-light text-dark border">🤖 Claude AI</span>
+          <span id="step-report"class="badge bg-light text-dark border">📄 Report</span>
+        </div>
+      </div>
+
+      <div id="done-area" class="d-none">
+        <i class="bi bi-check-circle-fill text-success" style="font-size:3.5rem"></i>
+        <h4 class="fw-bold mt-3 mb-1">Analysis Complete!</h4>
+        <p class="text-muted mb-4">Your portfolio report is ready.</p>
+        <div class="d-flex justify-content-center gap-3 flex-wrap">
+          <a href="/report/{{ run_id }}" target="_blank" class="btn btn-primary px-4">
+            <i class="bi bi-eye me-2"></i>View Report
+          </a>
+          <a href="/download/html/{{ run_id }}" class="btn btn-outline-secondary">
+            <i class="bi bi-download me-1"></i>Download HTML
+          </a>
+          <a href="/download/json/{{ run_id }}" class="btn btn-outline-secondary">
+            <i class="bi bi-filetype-json me-1"></i>Download JSON
+          </a>
+        </div>
+        <a href="/dashboard" class="btn btn-link mt-3 text-muted">← Back to Dashboard</a>
+      </div>
+
+      <div id="error-area" class="d-none">
+        <i class="bi bi-x-circle-fill text-danger" style="font-size:3.5rem"></i>
+        <h4 class="fw-bold mt-3 mb-1">Analysis Failed</h4>
+        <p id="error-msg" class="text-danger small mb-4"></p>
+        <a href="/dashboard" class="btn btn-outline-primary">← Try Again</a>
+      </div>
+
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const RUN_ID = "{{ run_id }}";
+const steps = {
+  "Reading":  "step-read",
+  "Fetching": "step-data",
+  "market":   "step-data",
+  "Consulting":"step-ai",
+  "Claude":   "step-ai",
+  "Generating":"step-report",
+};
+const progressByStep = {"step-read":20, "step-data":50, "step-ai":80, "step-report":95};
+
+function activate(stepId) {
+  document.querySelectorAll('#steps .badge').forEach(b => {
+    b.classList.remove('bg-primary','text-white');
+    b.classList.add('bg-light','text-dark');
+  });
+  const el = document.getElementById(stepId);
+  if (el) { el.classList.remove('bg-light','text-dark'); el.classList.add('bg-primary','text-white'); }
+}
+
+function poll() {
+  fetch(`/api/status/${RUN_ID}`)
+    .then(r => r.json())
+    .then(data => {
+      const msg = data.message || '';
+      document.getElementById('status-msg').textContent = msg;
+
+      // Determine active step
+      for (const [keyword, stepId] of Object.entries(steps)) {
+        if (msg.toLowerCase().includes(keyword.toLowerCase())) {
+          activate(stepId);
+          document.getElementById('progress-bar').style.width = progressByStep[stepId] + '%';
+          break;
+        }
+      }
+
+      if (data.status === 'completed') {
+        document.getElementById('progress-bar').style.width = '100%';
+        document.getElementById('spinner-area').classList.add('d-none');
+        document.getElementById('done-area').classList.remove('d-none');
+      } else if (data.status === 'failed') {
+        document.getElementById('spinner-area').classList.add('d-none');
+        document.getElementById('error-area').classList.remove('d-none');
+        document.getElementById('error-msg').textContent = msg || 'An unexpected error occurred.';
+      } else {
+        setTimeout(poll, 3000);
+      }
+    })
+    .catch(() => setTimeout(poll, 5000));
+}
+
+poll();
+</script>
+{% endblock %}
