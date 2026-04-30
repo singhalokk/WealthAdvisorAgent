@@ -1,59 +1,120 @@
 """
-Wealth Advisor web application.
+WealthAdvisorAgent — conversational chat web app.
 Run with: python3 web_app.py
-Then open: http://localhost:5000
+Then open: http://localhost:8080
 """
 
 from __future__ import annotations
 
 import json
-import math
 import os
+import re
 import sqlite3
 import threading
 import uuid
-from dataclasses import asdict
 from datetime import datetime
-from pathlib import Path
 from functools import wraps
+from pathlib import Path
 
-import numpy as np
-from flask import (Flask, abort, jsonify, redirect, render_template,
-                   request, send_file, session, url_for)
+from dotenv import load_dotenv
+load_dotenv()
+
+from flask import (Flask, Response, abort, jsonify, redirect, render_template,
+                   request, send_file, session, stream_with_context, url_for)
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_wtf.csrf import CSRFProtect, generate_csrf
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
-from werkzeug.utils import secure_filename
 
-from portfolio_reader import read_portfolio
-from market_data import analyze_portfolio
-from advisor import get_portfolio_advice
-from generate_report import build_html
-
-# ── App setup ─────────────────────────────────────────────────────────────────
+from agent import stream_response
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
 
-BASE_DIR  = Path(__file__).parent
-DATA_DIR  = BASE_DIR / "user_data"
-DB_PATH   = BASE_DIR / "instance" / "wealth_advisor.db"
+# ── Security config ───────────────────────────────────────────────────────────
+app.secret_key = os.environ.get("FLASK_SECRET", os.urandom(32))
+app.config["WTF_CSRF_TIME_LIMIT"]     = 3600
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"]   = \
+    os.environ.get("HTTPS", "false").lower() == "true"
+
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+
+csrf    = CSRFProtect(app)
+limiter = Limiter(get_remote_address, app=app, default_limits=[], storage_uri="memory://")
+
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "user_data"
+DB_PATH  = BASE_DIR / "instance" / "wealth_advisor.db"
 DATA_DIR.mkdir(exist_ok=True)
 DB_PATH.parent.mkdir(exist_ok=True)
 
-ALLOWED_EXTENSIONS = {".csv", ".txt"}
+_histories: dict[int, list] = {}
+MAX_HISTORY = 20
 
-# In-memory job progress (lost on restart, DB is source of truth for status)
-_jobs: dict[str, dict] = {}
+# Analysis status keyed by portfolio id
+_analysis_status: dict[str, str] = {}
+
+MAX_MESSAGE_LEN   = 2000
+MAX_PORTFOLIO_LEN = 50_000
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _portfolios_dir(user_id: int) -> Path:
+    d = DATA_DIR / str(user_id) / "portfolios"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _auto_name(source: str) -> str:
+    label = {"uploaded": "Uploaded", "entered": "Entered", "screen_read": "ScreenRead"}.get(source, "Portfolio")
+    return f"Portfolio_{label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+
+def _set_active(user_id: int, portfolio_id: str) -> None:
+    """Write the active portfolio id so tools.py can find it."""
+    (DATA_DIR / str(user_id) / ".active_portfolio").write_text(portfolio_id)
+
+
+def _get_active_id(user_id: int) -> str | None:
+    p = DATA_DIR / str(user_id) / ".active_portfolio"
+    return p.read_text().strip() if p.exists() else None
+
+
+# ── Security headers ──────────────────────────────────────────────────────────
+
+@app.after_request
+def set_security_headers(response: Response) -> Response:
+    if request.path.startswith("/report"):
+        return response
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"]        = "DENY"
+    response.headers["Referrer-Policy"]        = "strict-origin-when-cross-origin"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://unpkg.com; "
+        "style-src  'self' 'unsafe-inline'; "
+        "img-src    'self' data:; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none';"
+    )
+    response.set_cookie("csrf_token", generate_csrf(), samesite="Lax",
+                        httponly=False,
+                        secure=app.config["SESSION_COOKIE_SECURE"])
+    return response
 
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
-def get_db() -> sqlite3.Connection:
+def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def init_db() -> None:
+def init_db():
     with get_db() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS users (
@@ -63,20 +124,18 @@ def init_db() -> None:
                 password_hash TEXT NOT NULL,
                 created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-            CREATE TABLE IF NOT EXISTS runs (
-                id                TEXT PRIMARY KEY,
-                user_id           INTEGER NOT NULL,
-                original_filename TEXT,
-                status            TEXT DEFAULT 'pending',
-                error_message     TEXT,
-                created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                completed_at      TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(id)
+            CREATE TABLE IF NOT EXISTS portfolios (
+                id         TEXT PRIMARY KEY,
+                user_id    INTEGER NOT NULL,
+                name       TEXT NOT NULL,
+                source     TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );
         """)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Auth helpers ──────────────────────────────────────────────────────────────
 
 def login_required(f):
     @wraps(f)
@@ -87,85 +146,54 @@ def login_required(f):
     return wrapped
 
 
-def run_dir(user_id: int, run_id: str) -> Path:
-    d = DATA_DIR / str(user_id) / "runs" / run_id
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+# ── Background portfolio analysis ─────────────────────────────────────────────
 
-
-def _numpy_safe(obj):
-    if isinstance(obj, dict):
-        return {k: _numpy_safe(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_numpy_safe(v) for v in obj]
-    if isinstance(obj, np.integer):
-        return int(obj)
-    if isinstance(obj, np.floating):
-        return None if math.isnan(float(obj)) else float(obj)
-    if isinstance(obj, np.bool_):
-        return bool(obj)
-    return obj
-
-
-# ── Background analysis job ───────────────────────────────────────────────────
-
-def _run_analysis(run_id: str, user_id: int, csv_path: Path) -> None:
-    def update(status: str, message: str) -> None:
-        _jobs[run_id] = {"status": status, "message": message}
-
-    update("running", "Reading portfolio...")
+def _run_analysis(user_id: int, portfolio_id: str) -> None:
     try:
+        _analysis_status[portfolio_id] = "running"
+
+        from market_data import analyze_portfolio as _analyze_portfolio
+        from advisor import get_portfolio_advice
+        from generate_report import build_html
+        from portfolio_reader import read_portfolio
+        import dataclasses
+
+        csv_path = _portfolios_dir(user_id) / f"{portfolio_id}.csv"
         portfolio_df = read_portfolio(str(csv_path))
-        tickers = portfolio_df["ticker"].tolist()
+        tickers      = portfolio_df["ticker"].tolist()
+        analyses     = _analyze_portfolio(tickers)
+        advice       = get_portfolio_advice(analyses, portfolio_df)
 
-        update("running", f"Fetching live market data for {len(tickers)} holdings...")
-        analyses = analyze_portfolio(tickers)
-
-        update("running", "Consulting Claude AI for portfolio advice...")
-        advice = get_portfolio_advice(analyses, portfolio_df)
-
-        update("running", "Generating report...")
-        rdir = run_dir(user_id, run_id)
-        json_path = rdir / "results.json"
-        html_path = rdir / "report.html"
-
-        payload = {
-            "portfolio": portfolio_df.to_dict(orient="records"),
-            "analyses":  {k: _numpy_safe(asdict(v)) for k, v in analyses.items()},
-            "advice":    advice,
+        report_data = {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "advice":       advice,
+            "analyses":     {t: dataclasses.asdict(a) for t, a in analyses.items()},
         }
-        json_path.write_text(json.dumps(payload, indent=2))
-        html_path.write_text(build_html(payload, str(json_path)), encoding="utf-8")
 
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE runs SET status='completed', completed_at=? WHERE id=?",
-                (datetime.now().isoformat(), run_id),
-            )
-        update("completed", "Analysis complete!")
+        html = build_html(report_data, str(csv_path))
+        report_path = _portfolios_dir(user_id) / f"{portfolio_id}_report.html"
+        report_path.write_text(html, encoding="utf-8")
+
+        _analysis_status[portfolio_id] = "done"
 
     except Exception as exc:
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE runs SET status='failed', error_message=? WHERE id=?",
-                (str(exc), run_id),
-            )
-        update("failed", str(exc))
+        _analysis_status[portfolio_id] = f"error: {exc}"
 
 
 # ── Auth routes ───────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
-    return redirect(url_for("dashboard") if "user_id" in session else url_for("login"))
+    return redirect(url_for("chat") if "user_id" in session else url_for("login"))
 
 
 @app.route("/register", methods=["GET", "POST"])
+@limiter.limit("10 per minute")
 def register():
     error = None
     if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        email    = request.form.get("email", "").strip()
+        username = request.form.get("username", "").strip()[:80]
+        email    = request.form.get("email",    "").strip()[:254]
         password = request.form.get("password", "")
         if not username or not email or not password:
             error = "All fields are required."
@@ -181,14 +209,15 @@ def register():
                 return redirect(url_for("login", registered=1))
             except sqlite3.IntegrityError:
                 error = "Username or email already taken."
-    return render_template("register.html", error=error)
+    return render_template("login.html", mode="register", error=error)
 
 
 @app.route("/login", methods=["GET", "POST"])
+@limiter.limit("10 per minute", methods=["POST"])
 def login():
     error = None
     if request.method == "POST":
-        username = request.form.get("username", "").strip()
+        username = request.form.get("username", "").strip()[:80]
         password = request.form.get("password", "")
         with get_db() as conn:
             user = conn.execute(
@@ -197,139 +226,352 @@ def login():
         if user and check_password_hash(user["password_hash"], password):
             session["user_id"]  = user["id"]
             session["username"] = user["username"]
-            return redirect(url_for("dashboard"))
+            return redirect(url_for("chat"))
         error = "Invalid username or password."
-    return render_template("login.html", error=error, registered=request.args.get("registered"))
+    registered = request.args.get("registered")
+    return render_template("login.html", mode="login", error=error, registered=registered)
 
 
 @app.route("/logout")
 def logout():
+    uid = session.get("user_id")
+    if uid and uid in _histories:
+        del _histories[uid]
     session.clear()
     return redirect(url_for("login"))
 
 
-# ── Main app routes ───────────────────────────────────────────────────────────
+# ── Chat routes ───────────────────────────────────────────────────────────────
 
-@app.route("/dashboard")
+@app.route("/chat")
 @login_required
-def dashboard():
-    with get_db() as conn:
-        runs = conn.execute(
-            "SELECT * FROM runs WHERE user_id=? ORDER BY created_at DESC LIMIT 30",
-            (session["user_id"],),
-        ).fetchall()
-    return render_template("dashboard.html", runs=runs)
+def chat():
+    user_id    = session["user_id"]
+    active_id  = _get_active_id(user_id)
+    if active_id:
+        analysis_status = _analysis_status.get(active_id, "idle")
+        report_exists   = (_portfolios_dir(user_id) / f"{active_id}_report.html").exists()
+    else:
+        analysis_status = "idle"
+        report_exists   = False
+    return render_template("chat.html",
+                           active_portfolio_id=active_id,
+                           report_exists=report_exists,
+                           analysis_status=analysis_status)
 
 
-@app.route("/analyze", methods=["POST"])
+@app.route("/chat/stream")
 @login_required
-def analyze():
-    run_id  = str(uuid.uuid4())
+@csrf.exempt
+@limiter.limit("60 per minute")
+def chat_stream():
+    message = request.args.get("message", "").strip()[:MAX_MESSAGE_LEN]
+    if not message:
+        return Response("data: {}\n\n", mimetype="text/event-stream")
+
     user_id = session["user_id"]
-    rdir    = run_dir(user_id, run_id)
-    csv_path = rdir / "portfolio.csv"
-    original_filename = "manual_entry.csv"
+    history = _histories.get(user_id, [])
 
-    uploaded = request.files.get("portfolio_file")
+    def generate():
+        assistant_text = ""
+        for chunk in stream_response(message, history, user_id):
+            yield chunk
+            try:
+                payload = json.loads(chunk.removeprefix("data: ").strip())
+                if payload.get("type") == "text":
+                    assistant_text += payload.get("content", "")
+            except Exception:
+                pass
+
+        new_history = list(history)
+        new_history.append({"role": "user",     "content": message})
+        new_history.append({"role": "assistant", "content": assistant_text})
+        if len(new_history) > MAX_HISTORY * 2:
+            new_history = new_history[-(MAX_HISTORY * 2):]
+        _histories[user_id] = new_history
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.route("/chat/clear", methods=["POST"])
+@login_required
+def chat_clear():
+    _histories.pop(session["user_id"], None)
+    return ("", 204)
+
+
+# ── Portfolio CRUD ────────────────────────────────────────────────────────────
+
+@app.route("/api/portfolios")
+@login_required
+@csrf.exempt
+def list_portfolios():
+    user_id  = session["user_id"]
+    active_id = _get_active_id(user_id)
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, name, source, created_at FROM portfolios WHERE user_id=? ORDER BY created_at DESC",
+            (user_id,)
+        ).fetchall()
+    result = []
+    for r in rows:
+        pid = r["id"]
+        status = _analysis_status.get(pid, "idle")
+        report_ready = (_portfolios_dir(user_id) / f"{pid}_report.html").exists()
+        result.append({
+            "id":           pid,
+            "name":         r["name"],
+            "source":       r["source"],
+            "created_at":   r["created_at"],
+            "active":       pid == active_id,
+            "status":       status,
+            "report_ready": report_ready,
+        })
+    return jsonify(result)
+
+
+@app.route("/portfolio/upload", methods=["POST"])
+@login_required
+@limiter.limit("20 per minute")
+def portfolio_upload():
+    user_id = session["user_id"]
+
+    uploaded   = request.files.get("portfolio_file")
     text_input = request.form.get("portfolio_text", "").strip()
+    source     = request.form.get("source", "uploaded")
+    name       = request.form.get("name", "").strip()[:120] or _auto_name(source)
+
+    portfolio_id = str(uuid.uuid4())
+    csv_path     = _portfolios_dir(user_id) / f"{portfolio_id}.csv"
 
     if uploaded and uploaded.filename:
-        ext = Path(uploaded.filename).suffix.lower()
-        if ext not in ALLOWED_EXTENSIONS:
-            return redirect(url_for("dashboard"))
-        original_filename = secure_filename(uploaded.filename)
+        if len(uploaded.read()) > MAX_PORTFOLIO_LEN:
+            return ("File too large (max 50 KB)", 413)
+        uploaded.seek(0)
         uploaded.save(str(csv_path))
     elif text_input:
+        if len(text_input.encode()) > MAX_PORTFOLIO_LEN:
+            return ("Text too large (max 50 KB)", 413)
         csv_path.write_text(text_input)
     else:
-        return redirect(url_for("dashboard"))
+        return ("No data provided", 400)
 
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO runs (id, user_id, original_filename) VALUES (?, ?, ?)",
-            (run_id, user_id, original_filename),
+            "INSERT INTO portfolios (id, user_id, name, source) VALUES (?, ?, ?, ?)",
+            (portfolio_id, user_id, name, source),
         )
 
-    thread = threading.Thread(
-        target=_run_analysis, args=(run_id, user_id, csv_path), daemon=True
-    )
-    thread.start()
-    return redirect(url_for("status", run_id=run_id))
+    _set_active(user_id, portfolio_id)
+    _analysis_status[portfolio_id] = "running"
+    t = threading.Thread(target=_run_analysis, args=(user_id, portfolio_id), daemon=True)
+    t.start()
+
+    return jsonify({"id": portfolio_id, "name": name})
 
 
-@app.route("/status/<run_id>")
+@app.route("/api/portfolio/<pid>/select", methods=["POST"])
 @login_required
-def status(run_id):
+def portfolio_select(pid):
+    user_id = session["user_id"]
     with get_db() as conn:
-        run = conn.execute(
-            "SELECT * FROM runs WHERE id=? AND user_id=?",
-            (run_id, session["user_id"]),
+        row = conn.execute(
+            "SELECT id FROM portfolios WHERE id=? AND user_id=?", (pid, user_id)
         ).fetchone()
-    if not run:
+    if not row:
         abort(404)
-    return render_template("status.html", run=run, run_id=run_id)
+    _set_active(user_id, pid)
+    return ("", 204)
 
 
-@app.route("/api/status/<run_id>")
+@app.route("/api/portfolio/<pid>/analyze", methods=["POST"])
 @login_required
-def api_status(run_id):
-    job = _jobs.get(run_id)
-    if job:
-        return jsonify(job)
+def portfolio_reanalyze(pid):
+    user_id = session["user_id"]
     with get_db() as conn:
-        run = conn.execute(
-            "SELECT status, error_message FROM runs WHERE id=?", (run_id,)
+        row = conn.execute(
+            "SELECT id FROM portfolios WHERE id=? AND user_id=?", (pid, user_id)
         ).fetchone()
-    if run:
-        return jsonify({"status": run["status"], "message": run["error_message"] or ""})
-    return jsonify({"status": "unknown", "message": ""})
-
-
-@app.route("/report/<run_id>")
-@login_required
-def report(run_id):
-    with get_db() as conn:
-        run = conn.execute(
-            "SELECT * FROM runs WHERE id=? AND user_id=?",
-            (run_id, session["user_id"]),
-        ).fetchone()
-    if not run or run["status"] != "completed":
+    if not row:
         abort(404)
-    html_path = DATA_DIR / str(session["user_id"]) / "runs" / run_id / "report.html"
-    return send_file(str(html_path))
+    if _analysis_status.get(pid) == "running":
+        return jsonify({"status": "already_running"})
+    _analysis_status[pid] = "running"
+    t = threading.Thread(target=_run_analysis, args=(user_id, pid), daemon=True)
+    t.start()
+    return jsonify({"status": "started"})
 
 
-@app.route("/download/json/<run_id>")
+@app.route("/api/portfolio/<pid>", methods=["DELETE"])
 @login_required
-def download_json(run_id):
+def portfolio_delete(pid):
+    user_id = session["user_id"]
     with get_db() as conn:
-        run = conn.execute(
-            "SELECT * FROM runs WHERE id=? AND user_id=?",
-            (run_id, session["user_id"]),
+        row = conn.execute(
+            "SELECT id FROM portfolios WHERE id=? AND user_id=?", (pid, user_id)
         ).fetchone()
-    if not run or run["status"] != "completed":
+    if not row:
         abort(404)
-    path = DATA_DIR / str(session["user_id"]) / "runs" / run_id / "results.json"
-    return send_file(str(path), as_attachment=True, download_name="portfolio_analysis.json")
+    with get_db() as conn:
+        conn.execute("DELETE FROM portfolios WHERE id=?", (pid,))
+    # Remove files
+    for suffix in [".csv", "_report.html"]:
+        f = _portfolios_dir(user_id) / f"{pid}{suffix}"
+        if f.exists():
+            f.unlink()
+    _analysis_status.pop(pid, None)
+    # If this was the active portfolio, clear it
+    if _get_active_id(user_id) == pid:
+        active_file = DATA_DIR / str(user_id) / ".active_portfolio"
+        active_file.unlink(missing_ok=True)
+    return ("", 204)
 
 
-@app.route("/download/html/<run_id>")
+# ── Analysis status polling ───────────────────────────────────────────────────
+
+@app.route("/api/analysis/status")
 @login_required
-def download_html(run_id):
+@csrf.exempt
+def analysis_status():
+    user_id   = session["user_id"]
+    active_id = _get_active_id(user_id)
+    if not active_id:
+        return jsonify({"status": "idle", "report_ready": False, "portfolio_id": None})
+    status       = _analysis_status.get(active_id, "idle")
+    report_ready = (_portfolios_dir(user_id) / f"{active_id}_report.html").exists()
+    return jsonify({"status": status, "report_ready": report_ready, "portfolio_id": active_id})
+
+
+@app.route("/api/analysis/status/<pid>")
+@login_required
+@csrf.exempt
+def analysis_status_by_id(pid):
+    user_id = session["user_id"]
     with get_db() as conn:
-        run = conn.execute(
-            "SELECT * FROM runs WHERE id=? AND user_id=?",
-            (run_id, session["user_id"]),
+        row = conn.execute(
+            "SELECT id FROM portfolios WHERE id=? AND user_id=?", (pid, user_id)
         ).fetchone()
-    if not run or run["status"] != "completed":
+    if not row:
         abort(404)
-    path = DATA_DIR / str(session["user_id"]) / "runs" / run_id / "report.html"
-    return send_file(str(path), as_attachment=True, download_name="portfolio_report.html")
+    status       = _analysis_status.get(pid, "idle")
+    report_ready = (_portfolios_dir(user_id) / f"{pid}_report.html").exists()
+    return jsonify({"status": status, "report_ready": report_ready})
+
+
+# ── Report viewer ─────────────────────────────────────────────────────────────
+
+@app.route("/report/<pid>")
+@login_required
+def view_report(pid):
+    user_id = session["user_id"]
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id FROM portfolios WHERE id=? AND user_id=?", (pid, user_id)
+        ).fetchone()
+    if not row:
+        abort(404)
+    report_path = _portfolios_dir(user_id) / f"{pid}_report.html"
+    if not report_path.exists():
+        return ("Report not ready yet.", 404)
+    return send_file(str(report_path), mimetype="text/html")
+
+
+@app.route("/report/<pid>/download")
+@login_required
+def download_report(pid):
+    user_id = session["user_id"]
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT name FROM portfolios WHERE id=? AND user_id=?", (pid, user_id)
+        ).fetchone()
+    if not row:
+        abort(404)
+    report_path = _portfolios_dir(user_id) / f"{pid}_report.html"
+    if not report_path.exists():
+        return ("Report not ready yet.", 404)
+    safe_name = re.sub(r"[^\w\-]", "_", row["name"]) + ".html"
+    return send_file(str(report_path), mimetype="text/html",
+                     as_attachment=True, download_name=safe_name)
+
+
+# ── Portfolio screenshot reader ───────────────────────────────────────────────
+
+@app.route("/portfolio/screenshot", methods=["POST"])
+@login_required
+@limiter.limit("10 per minute")
+def portfolio_screenshot():
+    import anthropic as _anthropic
+
+    data      = request.get_json(silent=True) or {}
+    image_b64 = data.get("image", "")
+    if not image_b64:
+        return jsonify({"error": "No image provided"}), 400
+    if "," in image_b64:
+        image_b64 = image_b64.split(",", 1)[1]
+
+    try:
+        client = _anthropic.Anthropic()
+        msg = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64},
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Extract every stock, ETF, or mutual fund position visible in this image. "
+                            "For each row, read BOTH the code/ticker on the first line AND the full fund "
+                            "or company name on the second line. "
+                            "Return ONLY a JSON array — no explanation, no markdown. "
+                            'Each element: {"ticker":"AAPL","name":"Apple Inc","shares":50,"current_value":9250,"cost_basis":6000}. '
+                            "The 'name' field is the full fund or company name — include it even if long. "
+                            "Use null for numeric fields not visible. Exclude header rows, totals, cash."
+                        ),
+                    },
+                ],
+            }],
+        )
+        text  = msg.content[0].text.strip()
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        holdings = json.loads(match.group()) if match else []
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    return jsonify({"holdings": holdings})
+
+
+# ── Price polling ─────────────────────────────────────────────────────────────
+
+@app.route("/api/price/<ticker>")
+@login_required
+@csrf.exempt
+@limiter.limit("30 per minute")
+def api_price(ticker):
+    if not ticker.isalnum() or len(ticker) > 10:
+        abort(400)
+    from tools import tool_get_current_price
+    return tool_get_current_price(ticker.upper())
+
+
+# ── Rate-limit error handler ──────────────────────────────────────────────────
+
+@app.errorhandler(429)
+def too_many_requests(e):
+    return ("Too many requests — please slow down.", 429)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     init_db()
-    print("\n🚀  Wealth Advisor running at http://localhost:8080\n")
-    app.run(debug=False, host="0.0.0.0", port=8080)
+    print("\n🤖  WealthAdvisor Agent running at http://localhost:8080\n")
+    app.run(debug=False, host="0.0.0.0", port=8080, threaded=True)
